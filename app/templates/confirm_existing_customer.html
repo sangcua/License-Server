@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}Khách hàng đã tồn tại{% endblock %}
+{% block content %}
+<div class="card">
+  <h1>Khách hàng đã tồn tại</h1>
+  <p>Khách hàng <b>{{customer.name}}</b> đã có trong hệ thống{% if customer.license %} và đang sử dụng License #{{customer.license.id}}{% endif %}.</p>
+  <p>Hệ thống không tạo thêm khách hàng hoặc license mới. Hãy mở trang quản lý để tăng số máy, thêm serial hoặc gia hạn license hiện tại.</p>
+  <div class="row"><a class="button" href="/admin/customers/{{customer.id}}">Mở trang Nâng cấp License</a><a class="button secondary" href="/admin">Quay lại Dashboard</a></div>
+</div>
+{% endblock %}

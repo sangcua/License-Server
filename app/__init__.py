@@ -1,0 +1,2 @@
+"""AutoTool LicenseServer."""
+

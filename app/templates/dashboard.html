@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}Quản lý License{% endblock %}
+{% block content %}
+<h1>Quản lý License</h1>
+{% if one_time_key %}<div class="key"><b>Key chỉ hiển thị một lần:</b><br>{{ one_time_key }}</div>{% endif %}
+
+<div class="grid">
+  <div class="card"><div class="stat">{{ stats.active }}</div>Đang dùng</div>
+  <div class="card"><div class="stat">{{ stats.locked }}</div>Đã khóa</div>
+  <div class="card"><div class="stat">{{ stats.expired }}</div>Hết hạn</div>
+  <div class="card"><div class="stat">{{ stats.expiring }}</div>Sắp hết hạn 7 ngày</div>
+</div>
+
+<div class="card">
+  <h2>Tạo khách hàng + License</h2>
+  <p class="muted">Tạo khách hàng, cấp thiết bị và phát key trong một lần. Mỗi khách hàng chỉ có một license.</p>
+  <form method="post" action="/admin/licenses">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="customer_id" value="">
+    <div class="row">
+      <label>Tên khách hàng *<br><input name="new_customer_name" maxlength="160" required autofocus></label>
+      <label>Ghi chú / liên hệ<br><input name="new_customer_notes" maxlength="500"></label>
+      <label>Số ngày *<br><input type="number" name="duration_days" value="30" min="1" max="36500" required></label>
+      <label>Số máy tối đa *<br><input type="number" name="max_devices" value="1" min="1" max="10000" required></label>
+    </div>
+    <p><label>Hardware serial, mỗi dòng một mã<br><textarea name="serials" rows="4" placeholder="RFCWA172XFK"></textarea></label></p>
+    <button>Tạo khách hàng và phát key</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Khách hàng</h2>
+  <table><thead><tr><th>Tên</th><th>Ghi chú</th><th>Trạng thái khách hàng</th><th>License</th><th>Thiết bị</th><th></th></tr></thead><tbody>
+  {% for customer in customers %}
+    <tr><td><a href="/admin/customers/{{customer.id}}"><b>{{customer.name}}</b></a></td><td>{{customer.notes or '-'}}</td><td><span class="badge">{{'Hoạt động' if customer.is_active else 'Đã khóa'}}</span></td><td>{{customer.license.status if customer.license else 'Chưa có'}}</td><td>{% if customer.license %}{{customer.license.devices|length}} / {{customer.license.max_devices}}{% else %}-{% endif %}</td><td><a class="button secondary" href="/admin/customers/{{customer.id}}">Quản lý / Nâng cấp</a></td></tr>
+  {% else %}<tr><td colspan="6">Chưa có khách hàng. Hãy dùng form bên trên để tạo khách hàng đầu tiên.</td></tr>{% endfor %}
+  </tbody></table>
+</div>
+
+<div class="card">
+  <h2>License</h2>
+  <form method="get" action="/admin" class="row">
+    <label>Tìm khách hàng, key prefix hoặc serial<br><input name="q" value="{{query}}"></label>
+    <label>Trạng thái<br><select name="status"><option value="">Tất cả</option><option value="active" {% if status_filter=='active' %}selected{% endif %}>Đang dùng</option><option value="ready" {% if status_filter=='ready' %}selected{% endif %}>Chưa kích hoạt</option><option value="locked" {% if status_filter=='locked' %}selected{% endif %}>Đã khóa</option><option value="expired" {% if status_filter=='expired' %}selected{% endif %}>Hết hạn</option><option value="expiring" {% if status_filter=='expiring' %}selected{% endif %}>Sắp hết hạn</option></select></label>
+    <button>Lọc</button><a class="button secondary" href="/admin">Xóa lọc</a>
+  </form>
+  <table><thead><tr><th>ID</th><th>Khách hàng</th><th>Key prefix</th><th>Trạng thái</th><th>Thiết bị</th><th>Kích hoạt</th><th>Hết hạn</th></tr></thead><tbody>
+  {% for item in licenses %}<tr><td><a href="/admin/licenses/{{item.id}}">#{{item.id}}</a></td><td><a href="/admin/customers/{{item.customer.id}}">{{item.customer.name}}</a></td><td>{{item.key_prefix}}</td><td><span class="badge">{{item.status}}</span>{% if not item.customer.is_active %} <span class="badge">khách đã khóa</span>{% endif %}</td><td>{{item.devices|length}} / {{item.max_devices}}</td><td>{{item.activated_at.astimezone(tz).strftime('%d/%m/%Y %H:%M') if item.activated_at else '-'}}</td><td>{{item.expires_at.astimezone(tz).strftime('%d/%m/%Y %H:%M') if item.expires_at else '-'}}</td></tr>
+  {% else %}<tr><td colspan="7">Không tìm thấy license phù hợp.</td></tr>{% endfor %}
+  </tbody></table>
+</div>
+
+<div class="card"><h2>Cấu hình</h2><form method="post" action="/admin/settings"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>Phiên bản AutoTool tối thiểu <input name="min_client_version" value="{{min_version}}" required></label> <button>Lưu</button></form></div>
+{% endblock %}
