@@ -12,8 +12,7 @@ from sqlalchemy import select
 
 from app.config import get_settings
 from app.database import SessionLocal
-from app.models import AdminUser, Base, SystemSetting
-from app.database import engine
+from app.models import AdminUser, SystemSetting
 from app.security import hash_password, load_or_create_signing_key, public_key_pem
 
 
@@ -25,7 +24,6 @@ def main() -> None:
     if len(args.password) < 12:
         raise SystemExit("Mật khẩu admin cần ít nhất 12 ký tự")
     settings = get_settings()
-    Base.metadata.create_all(engine)
     key = load_or_create_signing_key(settings.signing_private_key_path)
     public_path = Path(settings.signing_private_key_path).with_name("ed25519-public.pem")
     public_path.write_bytes(public_key_pem(key))

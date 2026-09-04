@@ -29,15 +29,17 @@ Source AutoTool tự tìm public key tại `LicenseServer/secrets/ed25519-public
 
 ## Luồng thử end-to-end
 
-1. Mở Admin và dùng form **Tạo khách hàng + License**.
+1. Mở Admin và dùng form **Tạo khách hàng + License**, nhập số ngày và ít nhất một serial.
 2. Lấy hardware serial trong màn hình kích hoạt AutoTool, paste vào form này.
 3. Sao chép key ở khung màu xanh; khách hàng và license được tạo chung trong một transaction, key đầy đủ chỉ hiện một lần.
 4. Nhập key vào AutoTool khi đang kết nối ít nhất một serial đã cấp.
 5. Kiểm tra cột License: máy được cấp có thể tích chọn, máy lạ chỉ hiển thị.
-6. Thử Khóa/Mở khóa; AutoTool online nhận thay đổi ở heartbeat kế tiếp (25–35 giây) và dừng/mở lại an toàn.
-7. Dùng Rotate key khi cần vô hiệu hóa vĩnh viễn key và toàn bộ phiên kích hoạt cũ.
+6. Thêm máy sau này bằng cùng key; mỗi lô mới có ngày bắt đầu và hết hạn riêng.
+7. Gia hạn bằng cách chọn một hoặc nhiều serial. Máy còn hạn được cộng nối tiếp, máy hết hạn bắt đầu kỳ mới từ lúc gia hạn.
+8. Thử Khóa/Mở khóa; AutoTool online nhận thay đổi ở heartbeat kế tiếp (25–35 giây) và dừng/mở lại an toàn.
+9. Dùng Rotate key khi cần vô hiệu hóa vĩnh viễn key và toàn bộ phiên kích hoạt cũ.
 
-Mỗi khách hàng chỉ có một license. Muốn tăng số máy, thêm serial hoặc gia hạn, mở trang **Quản lý / Nâng cấp** của khách hàng. Nâng cấp giữ nguyên key và phiên AutoTool hiện tại.
+Mỗi khách hàng chỉ có một license. Số máy bằng đúng số serial đã cấp, không có giới hạn khai báo trước. Thêm serial hoặc gia hạn từng máy đều giữ nguyên key và phiên AutoTool hiện tại.
 
 Muốn tạo dữ liệu demo (không dùng cho production):
 
@@ -50,6 +52,7 @@ docker compose run --rm api python scripts/seed_demo.py
 ```powershell
 python -m pip install -r requirements.txt
 $env:DATABASE_URL = "sqlite+pysqlite:///./license_server.db"
+alembic upgrade head
 python scripts/bootstrap.py --username admin --password "MatKhauRatManh-123"
 uvicorn app.main:app --host 127.0.0.1 --port 9100 --reload
 ```

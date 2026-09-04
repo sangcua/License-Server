@@ -38,6 +38,30 @@ def iso(value: datetime) -> str:
     return as_utc(value).isoformat().replace("+00:00", "Z")
 
 
+def device_status(device: LicenseDevice, now: datetime | None = None) -> str:
+    """Return the entitlement status without persisting redundant state."""
+    current = as_utc(now or utcnow())
+    starts_at = as_utc(device.starts_at)
+    expires_at = as_utc(device.expires_at)
+    if starts_at is None or expires_at is None:
+        return "pending"
+    return "active" if expires_at > current else "expired"
+
+
+def sync_license_status(license_obj: License, now: datetime | None = None) -> str:
+    """Synchronize the derived license lifecycle while preserving an explicit lock."""
+    if license_obj.status == LicenseStatus.LOCKED.value:
+        return license_obj.status
+    current = as_utc(now or utcnow())
+    if license_obj.activated_at is None:
+        license_obj.status = LicenseStatus.READY.value
+    elif any(device_status(item, current) == "active" for item in license_obj.devices):
+        license_obj.status = LicenseStatus.ACTIVE.value
+    else:
+        license_obj.status = LicenseStatus.EXPIRED.value
+    return license_obj.status
+
+
 def normalize_serials(values: list[str]) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
@@ -99,38 +123,44 @@ class LicenseService:
         return activation
 
     def _validate_license(self, license_obj: License, now: datetime) -> None:
-        expires_at = as_utc(license_obj.expires_at)
-        if expires_at and expires_at <= now:
-            license_obj.status = LicenseStatus.EXPIRED.value
-            raise LicenseServiceError("expired", "License đã hết hạn", 403)
-        if license_obj.status == LicenseStatus.EXPIRED.value:
-            raise LicenseServiceError("expired", "License đã hết hạn", 403)
         if not license_obj.customer.is_active:
             raise LicenseServiceError("locked", "Khách hàng đã bị admin khóa", 403)
         if license_obj.status == LicenseStatus.LOCKED.value:
             raise LicenseServiceError("locked", "License đã bị admin khóa", 403)
+        if sync_license_status(license_obj, now) == LicenseStatus.EXPIRED.value:
+            raise LicenseServiceError("expired", "Tất cả thiết bị của license đã hết hạn", 403)
 
     def _lease_payload(self, db: Session, license_obj: License, connected: list[str], app_version: str, now: datetime) -> dict:
-        expires_at = as_utc(license_obj.expires_at)
-        if expires_at is None:
-            raise LicenseServiceError("not_activated", "License chưa được kích hoạt", 409)
-        lease_expires = min(expires_at, now + timedelta(hours=max(1, min(self.settings.lease_hours, 24))))
-        allowed = [item.hardware_serial for item in license_obj.devices]
+        active = [item for item in license_obj.devices if device_status(item, now) == "active"]
+        if not active:
+            raise LicenseServiceError("expired", "Tất cả thiết bị của license đã hết hạn", 403)
+        expiries = [as_utc(item.expires_at) for item in active if item.expires_at]
+        nearest_expiry = min(expiries)
+        latest_expiry = max(expiries)
+        lease_expires = min(latest_expiry, now + timedelta(hours=max(1, min(self.settings.lease_hours, 24))))
+        allowed = [item.hardware_serial for item in active]
         allowed_set = set(allowed)
         connected_allowed_count = len(allowed_set.intersection(connected))
         minimum = self._minimum_version(db)
+        rows_by_serial = {item.hardware_serial: item for item in license_obj.devices}
+        all_serials = sorted(set(rows_by_serial) | set(connected))
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "license_id": license_obj.id,
             "customer_name": license_obj.customer.name,
             "license_status": license_obj.status,
-            "duration_days": license_obj.duration_days,
-            "max_devices": license_obj.max_devices,
-            "assigned_device_count": len(allowed_set),
+            # Legacy summary keys remain during the coordinated client rollout.
+            "duration_days": max((item.term_days for item in license_obj.devices), default=0),
+            "max_devices": len(license_obj.devices),
+            "assigned_device_count": len(license_obj.devices),
+            "active_device_count": len(active),
+            "expired_device_count": sum(device_status(item, now) == "expired" for item in license_obj.devices),
             "connected_allowed_count": connected_allowed_count,
             "issued_at": iso(now),
-            "subscription_expires_at": iso(expires_at),
+            "subscription_expires_at": iso(latest_expiry),
             "lease_expires_at": iso(lease_expires),
+            "nearest_device_expires_at": iso(nearest_expiry),
+            "latest_device_expires_at": iso(latest_expiry),
             "minimum_client_version": minimum,
             "update_required": version_too_old(app_version, minimum),
             "allowed_serials": sorted(allowed),
@@ -139,8 +169,12 @@ class LicenseService:
                     "hardware_serial": serial,
                     "allowed": serial in allowed_set,
                     "connected": serial in connected,
+                    "status": device_status(rows_by_serial[serial], now) if serial in rows_by_serial else "unassigned",
+                    "starts_at": iso(rows_by_serial[serial].starts_at) if serial in rows_by_serial and rows_by_serial[serial].starts_at else None,
+                    "expires_at": iso(rows_by_serial[serial].expires_at) if serial in rows_by_serial and rows_by_serial[serial].expires_at else None,
+                    "remaining_seconds": max(0, int((as_utc(rows_by_serial[serial].expires_at) - now).total_seconds())) if serial in rows_by_serial and rows_by_serial[serial].expires_at else 0,
                 }
-                for serial in sorted(set(allowed) | set(connected))
+                for serial in all_serials
             ],
         }
 
@@ -151,15 +185,25 @@ class LicenseService:
         now = utcnow()
         connected = normalize_serials(serials)
         license_obj = self._license_by_key(db, key.strip())
-        self._validate_license(license_obj, now)
-        allowed_set = {item.hardware_serial for item in license_obj.devices}
-        if not allowed_set:
+        if not license_obj.customer.is_active:
+            raise LicenseServiceError("locked", "Khách hàng đã bị admin khóa", 403)
+        if license_obj.status == LicenseStatus.LOCKED.value:
+            raise LicenseServiceError("locked", "License đã bị admin khóa", 403)
+        eligible_set = {
+            item.hardware_serial
+            for item in license_obj.devices
+            if device_status(item, now) in {"pending", "active"}
+        }
+        if not license_obj.devices:
             raise LicenseServiceError("no_devices", "License chưa được admin cấp hardware serial", 403)
-        if not allowed_set.intersection(connected):
-            raise LicenseServiceError("no_approved_device", "Cần kết nối ít nhất một thiết bị đã được cấp phép", 403)
+        if not eligible_set.intersection(connected):
+            raise LicenseServiceError("no_approved_device", "Cần kết nối ít nhất một thiết bị còn quyền sử dụng", 403)
         if license_obj.activated_at is None:
             license_obj.activated_at = now
-            license_obj.expires_at = now + timedelta(days=license_obj.duration_days)
+            for item in license_obj.devices:
+                if item.starts_at is None or item.expires_at is None:
+                    item.starts_at = now
+                    item.expires_at = now + timedelta(days=item.term_days)
             license_obj.status = LicenseStatus.ACTIVE.value
         self._validate_license(license_obj, now)
 

@@ -35,7 +35,7 @@ def main() -> None:
             )
             return
         key = generate_license_key()
-        license_obj = License(customer=customer, duration_days=7, max_devices=2, key_prefix=key[:13], key_fingerprint=token_fingerprint(key, settings.license_key_pepper), devices=[LicenseDevice(hardware_serial="DEMO-SERIAL-01", alias="Máy demo")])
+        license_obj = License(customer=customer, key_prefix=key[:13], key_fingerprint=token_fingerprint(key, settings.license_key_pepper), devices=[LicenseDevice(hardware_serial="DEMO-SERIAL-01", alias="Máy demo", term_days=7)])
         db.add(license_obj)
         db.commit()
         print("License demo đã tạo. Key chỉ hiển thị lần này:")

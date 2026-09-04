@@ -1,0 +1,9 @@
+.git
+.gitignore
+.env
+secrets/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.db
+tests/

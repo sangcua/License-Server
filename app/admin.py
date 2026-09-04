@@ -19,7 +19,7 @@ from .database import get_db
 from .models import Activation, AdminUser, AuditLog, Customer, License, LicenseDevice, LicenseStatus, SystemSetting
 from .rate_limit import MemoryRateLimiter
 from .security import generate_license_key, hash_password, token_fingerprint, verify_password
-from .service import SERIAL_RE, as_utc, utcnow
+from .service import SERIAL_RE, as_utc, device_status, sync_license_status, utcnow
 
 
 def make_admin_router(settings: Settings) -> APIRouter:
@@ -27,6 +27,18 @@ def make_admin_router(settings: Settings) -> APIRouter:
     templates = Jinja2Templates(directory=str(__import__("pathlib").Path(__file__).parent / "templates"))
     login_limiter = MemoryRateLimiter()
     tz = ZoneInfo(settings.admin_timezone)
+
+    def remaining_text(device: LicenseDevice) -> str:
+        status = device_status(device)
+        if status == "pending":
+            return f"Chờ kích hoạt ({device.term_days} ngày)"
+        if status == "expired":
+            return "Đã hết hạn"
+        seconds = max(0, int((as_utc(device.expires_at) - utcnow()).total_seconds()))
+        days, remainder = divmod(seconds, 86400)
+        return f"{days} ngày {remainder // 3600} giờ"
+
+    templates.env.globals.update(device_status=device_status, remaining_text=remaining_text)
 
     def csrf(request: Request) -> str:
         value = request.session.get("csrf")
@@ -62,6 +74,69 @@ def make_admin_router(settings: Settings) -> APIRouter:
         if item is None:
             raise HTTPException(404, "Không tìm thấy license")
         return item
+
+    def metrics(item: License, now=None) -> dict:
+        current = now or utcnow()
+        active = [device for device in item.devices if device_status(device, current) == "active"]
+        expired = [device for device in item.devices if device_status(device, current) == "expired"]
+        pending = [device for device in item.devices if device_status(device, current) == "pending"]
+        active_expiries = [as_utc(device.expires_at) for device in active if device.expires_at]
+        return {
+            "total": len(item.devices),
+            "active": len(active),
+            "expired": len(expired),
+            "pending": len(pending),
+            "nearest_expiry": min(active_expiries) if active_expiries else None,
+            "latest_expiry": max(active_expiries) if active_expiries else None,
+            "expiring": sum(bool(device.expires_at and current < as_utc(device.expires_at) <= current + timedelta(days=7)) for device in active),
+        }
+
+    def new_device(*, license_obj: License, hardware_serial: str, term_days: int, alias: str = "", now=None) -> LicenseDevice:
+        granted = now or utcnow()
+        started = granted if license_obj.activated_at is not None else None
+        return LicenseDevice(
+            license=license_obj,
+            hardware_serial=hardware_serial,
+            alias=alias,
+            term_days=term_days,
+            granted_at=granted,
+            starts_at=started,
+            expires_at=started + timedelta(days=term_days) if started else None,
+        )
+
+    def renew_selected(item: License, device_ids: list[int], days: int, now=None) -> list[dict]:
+        if not (1 <= days <= 36500):
+            raise HTTPException(400, "Số ngày gia hạn không hợp lệ")
+        selected_ids = set(device_ids)
+        selected = [device for device in item.devices if device.id in selected_ids]
+        if not selected or len(selected) != len(selected_ids):
+            raise HTTPException(400, "Hãy chọn ít nhất một thiết bị hợp lệ để gia hạn")
+        current = now or utcnow()
+        changes = []
+        for device in selected:
+            before = {
+                "serial": device.hardware_serial,
+                "term_days": device.term_days,
+                "starts_at": as_utc(device.starts_at).isoformat() if device.starts_at else None,
+                "expires_at": as_utc(device.expires_at).isoformat() if device.expires_at else None,
+            }
+            if device.starts_at is None or device.expires_at is None:
+                device.term_days += days
+            elif as_utc(device.expires_at) > current:
+                device.term_days += days
+                device.expires_at = as_utc(device.expires_at) + timedelta(days=days)
+            else:
+                device.term_days = days
+                device.starts_at = current
+                device.expires_at = current + timedelta(days=days)
+            changes.append({"before": before, "after": {
+                "serial": device.hardware_serial,
+                "term_days": device.term_days,
+                "starts_at": as_utc(device.starts_at).isoformat() if device.starts_at else None,
+                "expires_at": as_utc(device.expires_at).isoformat() if device.expires_at else None,
+            }})
+        sync_license_status(item, current)
+        return changes
 
     @router.get("/login", response_class=HTMLResponse)
     def login_page(request: Request):
@@ -110,15 +185,18 @@ def make_admin_router(settings: Settings) -> APIRouter:
         now = utcnow()
         all_licenses = db.scalars(select(License).options(selectinload(License.customer), selectinload(License.devices)).order_by(License.created_at.desc())).all()
         for item in all_licenses:
-            if item.expires_at and as_utc(item.expires_at) <= now and item.status in {LicenseStatus.ACTIVE.value, LicenseStatus.LOCKED.value}:
-                item.status = LicenseStatus.EXPIRED.value
+            sync_license_status(item, now)
         db.commit()
+        license_metrics = {item.id: metrics(item, now) for item in all_licenses}
         stats = {status.value: 0 for status in LicenseStatus}
         stats[LicenseStatus.READY.value] = sum(item.status == LicenseStatus.READY.value and item.customer.is_active for item in all_licenses)
         stats[LicenseStatus.ACTIVE.value] = sum(item.status == LicenseStatus.ACTIVE.value and item.customer.is_active for item in all_licenses)
         stats[LicenseStatus.LOCKED.value] = sum((item.status == LicenseStatus.LOCKED.value or not item.customer.is_active) and item.status != LicenseStatus.EXPIRED.value for item in all_licenses)
         stats[LicenseStatus.EXPIRED.value] = sum(item.status == LicenseStatus.EXPIRED.value for item in all_licenses)
-        stats["expiring"] = sum(bool(item.expires_at and now < as_utc(item.expires_at) <= now + timedelta(days=7)) for item in all_licenses)
+        stats["expiring"] = sum(value["expiring"] for value in license_metrics.values())
+        stats["total_devices"] = sum(value["total"] for value in license_metrics.values())
+        stats["active_devices"] = sum(value["active"] for value in license_metrics.values())
+        stats["expired_devices"] = sum(value["expired"] for value in license_metrics.values())
         query = request.query_params.get("q", "").strip()
         status_filter = request.query_params.get("status", "").strip()
         licenses = all_licenses
@@ -126,7 +204,7 @@ def make_admin_router(settings: Settings) -> APIRouter:
             needle = query.casefold()
             licenses = [item for item in licenses if needle in item.customer.name.casefold() or needle in item.key_prefix.casefold() or any(needle in device.hardware_serial.casefold() for device in item.devices)]
         if status_filter == "expiring":
-            licenses = [item for item in licenses if item.expires_at and now < as_utc(item.expires_at) <= now + timedelta(days=7)]
+            licenses = [item for item in licenses if license_metrics[item.id]["expiring"]]
         elif status_filter == LicenseStatus.LOCKED.value:
             licenses = [item for item in licenses if (item.status == LicenseStatus.LOCKED.value or not item.customer.is_active) and item.status != LicenseStatus.EXPIRED.value]
         elif status_filter == LicenseStatus.ACTIVE.value:
@@ -139,7 +217,7 @@ def make_admin_router(settings: Settings) -> APIRouter:
             .order_by(Customer.name)
         ).all()
         min_version = db.get(SystemSetting, "min_client_version")
-        return render(request, "dashboard.html", {"licenses": licenses, "customers": customers, "stats": stats, "min_version": min_version.value if min_version else settings.min_client_version, "one_time_key": request.session.pop("one_time_key", ""), "query": query, "status_filter": status_filter})
+        return render(request, "dashboard.html", {"licenses": licenses, "customers": customers, "stats": stats, "license_metrics": license_metrics, "min_version": min_version.value if min_version else settings.min_client_version, "one_time_key": request.session.pop("one_time_key", ""), "query": query, "status_filter": status_filter})
 
     @router.post("/customers/{customer_id}")
     def update_customer(customer_id: int, request: Request, name: str = Form(), notes: str = Form(""), is_active: str = Form(""), csrf_token: str = Form(), db: Session = Depends(get_db)):
@@ -173,10 +251,12 @@ def make_admin_router(settings: Settings) -> APIRouter:
         )
         if customer is None:
             raise HTTPException(404, "Không tìm thấy khách hàng")
-        return render(request, "customer.html", {"customer": customer})
+        if customer.license:
+            sync_license_status(customer.license)
+        return render(request, "customer.html", {"customer": customer, "metrics": metrics(customer.license) if customer.license else {}})
 
     @router.post("/licenses")
-    def create_license(request: Request, customer_id: str = Form(""), new_customer_name: str = Form(""), new_customer_notes: str = Form(""), duration_days: int = Form(), max_devices: int = Form(), serials: str = Form(""), csrf_token: str = Form(), db: Session = Depends(get_db)):
+    def create_license(request: Request, customer_id: str = Form(""), new_customer_name: str = Form(""), new_customer_notes: str = Form(""), duration_days: int = Form(), serials: str = Form(""), csrf_token: str = Form(), db: Session = Depends(get_db)):
         require_csrf(request, csrf_token)
         admin = current_admin(request, db)
         customer = None
@@ -188,7 +268,7 @@ def make_admin_router(settings: Settings) -> APIRouter:
             if customer is None:
                 raise HTTPException(404, "Không tìm thấy khách hàng")
             if customer.license is not None:
-                raise HTTPException(409, "Khách hàng đã có license; hãy dùng chức năng Nâng cấp License")
+                raise HTTPException(409, "Khách hàng đã có license; hãy dùng trang quản lý thiết bị")
         elif new_customer_name.strip():
             clean_name = new_customer_name.strip()
             existing_customer = db.scalar(
@@ -214,31 +294,31 @@ def make_admin_router(settings: Settings) -> APIRouter:
             raise HTTPException(400, "Tên khách hàng là bắt buộc")
         if not customer.is_active:
             raise HTTPException(400, "Khách hàng đang bị khóa")
-        if not (1 <= duration_days <= 36500 and 1 <= max_devices <= 10000):
-            raise HTTPException(400, "Số ngày hoặc số thiết bị không hợp lệ")
+        if not (1 <= duration_days <= 36500):
+            raise HTTPException(400, "Số ngày không hợp lệ")
         parsed = [line.strip() for line in serials.replace(",", "\n").splitlines() if line.strip()]
         parsed = list(dict.fromkeys(parsed))
-        if len(parsed) > max_devices:
-            raise HTTPException(400, "Danh sách serial vượt giới hạn thiết bị")
+        if not parsed:
+            raise HTTPException(400, "Cần nhập ít nhất một hardware serial")
         if any(not SERIAL_RE.fullmatch(item) for item in parsed):
             raise HTTPException(400, "Danh sách có hardware serial không hợp lệ")
         raw_key = generate_license_key()
-        license_obj = License(customer=customer, duration_days=duration_days, max_devices=max_devices, key_prefix=raw_key[:13], key_fingerprint=token_fingerprint(raw_key, settings.license_key_pepper))
+        license_obj = License(customer=customer, key_prefix=raw_key[:13], key_fingerprint=token_fingerprint(raw_key, settings.license_key_pepper))
         db.add(license_obj)
         db.flush()
-        db.add_all(LicenseDevice(license=license_obj, hardware_serial=item) for item in parsed)
+        db.add_all(new_device(license_obj=license_obj, hardware_serial=item, term_days=duration_days) for item in parsed)
         try:
             db.flush()
         except IntegrityError as exc:
             db.rollback()
             raise HTTPException(409, "Có serial đã thuộc license khác") from exc
-        audit(db, request, admin, "license.create", "license", license_obj.id, {"duration_days": duration_days, "max_devices": max_devices, "serials": parsed})
+        audit(db, request, admin, "license.create", "license", license_obj.id, {"term_days": duration_days, "serials": parsed})
         db.commit()
         request.session["one_time_key"] = raw_key
         return RedirectResponse(f"/admin/licenses/{license_obj.id}", 303)
 
-    @router.post("/customers/{customer_id}/license/upgrade")
-    def upgrade_customer_license(customer_id: int, request: Request, max_devices: int = Form(), extend_days: int = Form(0), serials: str = Form(""), csrf_token: str = Form(), db: Session = Depends(get_db)):
+    @router.post("/customers/{customer_id}/license/devices")
+    def add_customer_devices(customer_id: int, request: Request, term_days: int = Form(), serials: str = Form(""), csrf_token: str = Form(), db: Session = Depends(get_db)):
         require_csrf(request, csrf_token)
         admin = current_admin(request, db)
         customer = db.get(Customer, customer_id)
@@ -254,19 +334,19 @@ def make_admin_router(settings: Settings) -> APIRouter:
         )
         if item is None:
             raise HTTPException(404, "Khách hàng chưa có license")
-        if not (1 <= max_devices <= 10000):
-            raise HTTPException(400, "Số máy tối đa không hợp lệ")
-        if not (0 <= extend_days <= 36500):
-            raise HTTPException(400, "Số ngày gia hạn không hợp lệ")
+        if not (1 <= term_days <= 36500):
+            raise HTTPException(400, "Số ngày thuê không hợp lệ")
 
         requested = [line.strip() for line in serials.replace(",", "\n").splitlines() if line.strip()]
         requested = list(dict.fromkeys(requested))
+        if not requested:
+            raise HTTPException(400, "Cần nhập ít nhất một hardware serial")
         if any(not SERIAL_RE.fullmatch(serial) for serial in requested):
             raise HTTPException(400, "Danh sách có hardware serial không hợp lệ")
         existing = {device.hardware_serial for device in item.devices}
         additions = [serial for serial in requested if serial not in existing]
-        if len(existing) + len(additions) > max_devices:
-            raise HTTPException(400, "Số serial sau cập nhật vượt số máy tối đa")
+        if not additions:
+            raise HTTPException(400, "Các serial này đã có trong license")
         conflicts = db.scalars(
             select(LicenseDevice).where(LicenseDevice.hardware_serial.in_(additions))
         ).all() if additions else []
@@ -274,32 +354,17 @@ def make_admin_router(settings: Settings) -> APIRouter:
             conflict_serials = ", ".join(sorted(device.hardware_serial for device in conflicts))
             raise HTTPException(409, f"Serial đã thuộc khách hàng khác: {conflict_serials}")
 
-        before = {
-            "max_devices": item.max_devices,
-            "duration_days": item.duration_days,
-            "expires_at": as_utc(item.expires_at).isoformat() if item.expires_at else None,
-            "status": item.status,
-            "serials": sorted(existing),
-            "key_prefix": item.key_prefix,
-        }
-        item.max_devices = max_devices
-        db.add_all(LicenseDevice(license=item, hardware_serial=serial) for serial in additions)
         now = utcnow()
-        if extend_days:
-            item.duration_days += extend_days
-            if item.expires_at:
-                item.expires_at = max(as_utc(item.expires_at), now) + timedelta(days=extend_days)
-                if item.status == LicenseStatus.EXPIRED.value:
-                    item.status = LicenseStatus.ACTIVE.value
-        after = {
-            "max_devices": item.max_devices,
-            "duration_days": item.duration_days,
-            "expires_at": as_utc(item.expires_at).isoformat() if item.expires_at else None,
-            "status": item.status,
-            "serials": sorted(existing | set(additions)),
+        rows = [new_device(license_obj=item, hardware_serial=serial, term_days=term_days, now=now) for serial in additions]
+        db.add_all(rows)
+        if item.status != LicenseStatus.LOCKED.value:
+            sync_license_status(item, now)
+        audit(db, request, admin, "license.devices_add", "license", item.id, {
+            "serials": additions,
+            "term_days": term_days,
+            "starts_immediately": item.activated_at is not None,
             "key_prefix": item.key_prefix,
-        }
-        audit(db, request, admin, "license.upgrade", "license", item.id, {"before": before, "after": after, "added_serials": additions, "extend_days": extend_days})
+        })
         try:
             db.commit()
         except IntegrityError as exc:
@@ -307,42 +372,60 @@ def make_admin_router(settings: Settings) -> APIRouter:
             raise HTTPException(409, "Có serial vừa được gán ở phiên quản trị khác") from exc
         return RedirectResponse(f"/admin/customers/{customer_id}", 303)
 
+    @router.post("/customers/{customer_id}/license/devices/renew")
+    def renew_customer_devices(customer_id: int, request: Request, device_ids: list[int] = Form(default=[]), days: int = Form(), csrf_token: str = Form(), db: Session = Depends(get_db)):
+        require_csrf(request, csrf_token)
+        admin = current_admin(request, db)
+        item = db.scalar(select(License).where(License.customer_id == customer_id).options(selectinload(License.devices)).with_for_update())
+        if item is None:
+            raise HTTPException(404, "Khách hàng chưa có license")
+        changes = renew_selected(item, device_ids, days)
+        audit(db, request, admin, "license.devices_renew", "license", item.id, {"days": days, "devices": changes})
+        db.commit()
+        return RedirectResponse(f"/admin/customers/{customer_id}", 303)
+
     @router.get("/licenses/{license_id}", response_class=HTMLResponse)
     def license_detail(license_id: int, request: Request, db: Session = Depends(get_db)):
         current_admin(request, db)
         item = load_license(db, license_id)
         audits = db.scalars(select(AuditLog).where(AuditLog.entity_type == "license", AuditLog.entity_id == str(license_id)).order_by(AuditLog.created_at.desc()).limit(100)).all()
-        return render(request, "license.html", {"license": item, "audits": audits, "one_time_key": request.session.pop("one_time_key", "")})
+        sync_license_status(item)
+        return render(request, "license.html", {"license": item, "metrics": metrics(item), "audits": audits, "one_time_key": request.session.pop("one_time_key", "")})
 
     @router.post("/licenses/{license_id}/devices")
-    def add_devices(license_id: int, request: Request, serials: str = Form(), aliases: str = Form(""), csrf_token: str = Form(), db: Session = Depends(get_db)):
+    def add_devices(license_id: int, request: Request, term_days: int = Form(), serials: str = Form(), csrf_token: str = Form(), db: Session = Depends(get_db)):
         require_csrf(request, csrf_token)
         admin = current_admin(request, db)
         item = load_license(db, license_id, True)
+        if not (1 <= term_days <= 36500):
+            raise HTTPException(400, "Số ngày thuê không hợp lệ")
         serial_list = [line.strip() for line in serials.replace(",", "\n").splitlines() if line.strip()]
-        alias_list = aliases.splitlines()
         serial_list = list(dict.fromkeys(serial_list))
         existing = {device.hardware_serial for device in item.devices}
         additions = [serial for serial in serial_list if serial not in existing]
-        if len(existing) + len(additions) > item.max_devices:
-            raise HTTPException(400, "Vượt giới hạn thiết bị của license")
+        if not additions:
+            raise HTTPException(400, "Cần nhập ít nhất một serial mới")
         if any(not SERIAL_RE.fullmatch(serial) for serial in additions):
             raise HTTPException(400, "Hardware serial không hợp lệ")
-        db.add_all(LicenseDevice(license=item, hardware_serial=serial, alias=alias_list[index].strip() if index < len(alias_list) else "") for index, serial in enumerate(additions))
+        now = utcnow()
+        db.add_all(new_device(license_obj=item, hardware_serial=serial, term_days=term_days, now=now) for serial in additions)
+        sync_license_status(item, now)
         try:
             db.flush()
         except IntegrityError as exc:
             db.rollback()
             raise HTTPException(409, "Có serial đã thuộc license khác; hãy dùng Transfer") from exc
-        audit(db, request, admin, "license.devices_add", "license", item.id, {"serials": additions})
+        audit(db, request, admin, "license.devices_add", "license", item.id, {"serials": additions, "term_days": term_days, "starts_immediately": item.activated_at is not None})
         db.commit()
         return RedirectResponse(f"/admin/licenses/{license_id}", 303)
 
     @router.post("/licenses/{license_id}/devices/import")
-    async def import_devices(license_id: int, request: Request, csv_file: UploadFile = File(), csrf_token: str = Form(), db: Session = Depends(get_db)):
+    async def import_devices(license_id: int, request: Request, term_days: int = Form(), csv_file: UploadFile = File(), csrf_token: str = Form(), db: Session = Depends(get_db)):
         require_csrf(request, csrf_token)
         admin = current_admin(request, db)
         item = load_license(db, license_id, True)
+        if not (1 <= term_days <= 36500):
+            raise HTTPException(400, "Số ngày thuê không hợp lệ")
         content = (await csv_file.read()).decode("utf-8-sig")
         rows = list(csv.DictReader(io.StringIO(content)))
         if not rows or "hardware_serial" not in (rows[0].keys() if rows else []):
@@ -356,15 +439,17 @@ def make_admin_router(settings: Settings) -> APIRouter:
             if not SERIAL_RE.fullmatch(serial):
                 raise HTTPException(400, f"Hardware serial không hợp lệ: {serial}")
             additions.append((serial, str(row.get("alias") or "").strip()))
-        if len(existing) + len(additions) > item.max_devices:
-            raise HTTPException(400, "CSV làm vượt giới hạn thiết bị")
-        db.add_all(LicenseDevice(license=item, hardware_serial=serial, alias=alias) for serial, alias in additions)
+        if not additions:
+            raise HTTPException(400, "CSV không có serial mới")
+        now = utcnow()
+        db.add_all(new_device(license_obj=item, hardware_serial=serial, term_days=term_days, alias=alias, now=now) for serial, alias in additions)
+        sync_license_status(item, now)
         try:
             db.flush()
         except IntegrityError as exc:
             db.rollback()
             raise HTTPException(409, "Có serial đã thuộc license khác; hãy dùng Transfer") from exc
-        audit(db, request, admin, "license.devices_import", "license", item.id, {"count": len(additions), "filename": csv_file.filename})
+        audit(db, request, admin, "license.devices_import", "license", item.id, {"count": len(additions), "term_days": term_days, "filename": csv_file.filename})
         db.commit()
         return RedirectResponse(f"/admin/licenses/{license_id}", 303)
 
@@ -384,12 +469,14 @@ def make_admin_router(settings: Settings) -> APIRouter:
     def delete_device(license_id: int, device_id: int, request: Request, csrf_token: str = Form(), db: Session = Depends(get_db)):
         require_csrf(request, csrf_token)
         admin = current_admin(request, db)
-        device = db.get(LicenseDevice, device_id)
-        if device is None or device.license_id != license_id:
+        item = load_license(db, license_id, True)
+        device = next((row for row in item.devices if row.id == device_id), None)
+        if device is None:
             raise HTTPException(404, "Không tìm thấy thiết bị")
-        serial = device.hardware_serial
-        db.delete(device)
-        audit(db, request, admin, "license.device_remove", "license", license_id, {"serial": serial})
+        before = {"serial": device.hardware_serial, "alias": device.alias, "term_days": device.term_days, "starts_at": as_utc(device.starts_at).isoformat() if device.starts_at else None, "expires_at": as_utc(device.expires_at).isoformat() if device.expires_at else None}
+        item.devices.remove(device)
+        sync_license_status(item)
+        audit(db, request, admin, "license.device_remove", "license", license_id, before)
         db.commit()
         return RedirectResponse(f"/admin/licenses/{license_id}", 303)
 
@@ -404,39 +491,33 @@ def make_admin_router(settings: Settings) -> APIRouter:
         device = next((row for row in source.devices if row.hardware_serial == hardware_serial.strip()), None)
         if device is None:
             raise HTTPException(404, "Serial không thuộc license nguồn")
-        if len(target.devices) >= target.max_devices:
-            raise HTTPException(400, "License đích đã đủ thiết bị")
-        device.license_id = target.id
-        audit(db, request, admin, "license.device_transfer", "license", source.id, {"serial": device.hardware_serial, "to_license": target.id})
-        audit(db, request, admin, "license.device_transfer_in", "license", target.id, {"serial": device.hardware_serial, "from_license": source.id})
+        before_entitlement = {"term_days": device.term_days, "starts_at": as_utc(device.starts_at).isoformat() if device.starts_at else None, "expires_at": as_utc(device.expires_at).isoformat() if device.expires_at else None}
+        device.license = target
+        if target.activated_at is not None and (device.starts_at is None or device.expires_at is None):
+            transfer_time = utcnow()
+            device.starts_at = transfer_time
+            device.expires_at = transfer_time + timedelta(days=device.term_days)
+        after_entitlement = {"term_days": device.term_days, "starts_at": as_utc(device.starts_at).isoformat() if device.starts_at else None, "expires_at": as_utc(device.expires_at).isoformat() if device.expires_at else None}
+        sync_license_status(source)
+        sync_license_status(target)
+        audit(db, request, admin, "license.device_transfer", "license", source.id, {"serial": device.hardware_serial, "to_license": target.id, "entitlement": before_entitlement})
+        audit(db, request, admin, "license.device_transfer_in", "license", target.id, {"serial": device.hardware_serial, "from_license": source.id, "entitlement": after_entitlement})
         db.commit()
         return RedirectResponse(f"/admin/licenses/{target.id}", 303)
 
     @router.post("/licenses/{license_id}/action")
-    def license_action(license_id: int, request: Request, action: str = Form(), days: int = Form(0), csrf_token: str = Form(), db: Session = Depends(get_db)):
+    def license_action(license_id: int, request: Request, action: str = Form(), csrf_token: str = Form(), db: Session = Depends(get_db)):
         require_csrf(request, csrf_token)
         admin = current_admin(request, db)
         item = load_license(db, license_id, True)
         now = utcnow()
-        before = {"status": item.status, "duration_days": item.duration_days, "max_devices": item.max_devices, "expires_at": as_utc(item.expires_at).isoformat() if item.expires_at else None}
-        if action == "extend":
-            if days < 1:
-                raise HTTPException(400, "Số ngày gia hạn phải lớn hơn 0")
-            if item.expires_at:
-                item.expires_at = max(as_utc(item.expires_at), now) + timedelta(days=days)
-                item.duration_days += days
-                if item.status == LicenseStatus.EXPIRED.value:
-                    item.status = LicenseStatus.ACTIVE.value
-            else:
-                item.duration_days += days
-        elif action in {"lock", "suspend", "revoke"}:
+        before = {"status": item.status}
+        if action in {"lock", "suspend", "revoke"}:
             # Legacy action names are accepted but now mean reversible lock.
             item.status = LicenseStatus.LOCKED.value
         elif action in {"unlock", "resume"}:
-            if item.expires_at and as_utc(item.expires_at) <= now:
-                item.status = LicenseStatus.EXPIRED.value
-            else:
-                item.status = LicenseStatus.ACTIVE.value if item.activated_at else LicenseStatus.READY.value
+            item.status = LicenseStatus.ACTIVE.value
+            sync_license_status(item, now)
         elif action == "rotate":
             raw_key = generate_license_key()
             item.key_prefix = raw_key[:13]
@@ -446,27 +527,8 @@ def make_admin_router(settings: Settings) -> APIRouter:
             request.session["one_time_key"] = raw_key
         else:
             raise HTTPException(400, "Thao tác license không hợp lệ")
-        after = {"status": item.status, "duration_days": item.duration_days, "max_devices": item.max_devices, "expires_at": as_utc(item.expires_at).isoformat() if item.expires_at else None}
-        audit(db, request, admin, f"license.{action}", "license", item.id, {"days": days, "before": before, "after": after})
-        db.commit()
-        return RedirectResponse(f"/admin/licenses/{license_id}", 303)
-
-    @router.post("/licenses/{license_id}/settings")
-    def update_license_settings(license_id: int, request: Request, duration_days: int = Form(), max_devices: int = Form(), csrf_token: str = Form(), db: Session = Depends(get_db)):
-        require_csrf(request, csrf_token)
-        admin = current_admin(request, db)
-        item = load_license(db, license_id, True)
-        if not (1 <= duration_days <= 36500 and 1 <= max_devices <= 10000):
-            raise HTTPException(400, "Số ngày hoặc số thiết bị không hợp lệ")
-        if max_devices < len(item.devices):
-            raise HTTPException(400, "Số máy tối đa không được nhỏ hơn số serial đã gán")
-        if item.activated_at is not None and duration_days != item.duration_days:
-            raise HTTPException(400, "License đã kích hoạt chỉ có thể gia hạn bằng cách cộng thêm ngày")
-        before = {"duration_days": item.duration_days, "max_devices": item.max_devices}
-        item.duration_days = duration_days
-        item.max_devices = max_devices
-        after = {"duration_days": item.duration_days, "max_devices": item.max_devices}
-        audit(db, request, admin, "license.settings", "license", item.id, {"before": before, "after": after})
+        after = {"status": item.status}
+        audit(db, request, admin, f"license.{action}", "license", item.id, {"before": before, "after": after})
         db.commit()
         return RedirectResponse(f"/admin/licenses/{license_id}", 303)
 
@@ -476,9 +538,9 @@ def make_admin_router(settings: Settings) -> APIRouter:
         item = load_license(db, license_id)
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(["hardware_serial", "alias", "last_seen_at"])
+        writer.writerow(["hardware_serial", "alias", "status", "term_days", "starts_at", "expires_at", "last_seen_at"])
         for device in item.devices:
-            writer.writerow([device.hardware_serial, device.alias, device.last_seen_at.isoformat() if device.last_seen_at else ""])
+            writer.writerow([device.hardware_serial, device.alias, device_status(device), device.term_days, device.starts_at.isoformat() if device.starts_at else "", device.expires_at.isoformat() if device.expires_at else "", device.last_seen_at.isoformat() if device.last_seen_at else ""])
         return StreamingResponse(iter(["\ufeff" + output.getvalue()]), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="license-{license_id}-devices.csv"'})
 
     @router.post("/settings")

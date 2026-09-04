@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     signing_private_key_path: Path = Path("secrets/ed25519-private.pem")
     admin_timezone: str = "Asia/Ho_Chi_Minh"
     lease_hours: int = 24
-    min_client_version: str = "1.2.0"
+    min_client_version: str = "1.3.0"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

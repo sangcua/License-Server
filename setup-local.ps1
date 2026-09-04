@@ -19,7 +19,7 @@ LICENSE_KEY_PEPPER=$Pepper
 SIGNING_PRIVATE_KEY_PATH=/app/secrets/ed25519-private.pem
 ADMIN_TIMEZONE=Asia/Ho_Chi_Minh
 LEASE_HOURS=24
-MIN_CLIENT_VERSION=1.2.0
+MIN_CLIENT_VERSION=1.3.0
 "@ | Set-Content -Encoding utf8 ".env"
 }
 New-Item -ItemType Directory -Force "secrets" | Out-Null
@@ -29,6 +29,8 @@ docker compose build
 if ($LASTEXITCODE -ne 0) { throw "Build LicenseServer API thất bại." }
 docker compose up -d db
 if ($LASTEXITCODE -ne 0) { throw "Không khởi động được PostgreSQL." }
+docker compose run --rm api alembic upgrade head
+if ($LASTEXITCODE -ne 0) { throw "Không migrate được database." }
 docker compose run --rm api python scripts/bootstrap.py --username $AdminUser --password $AdminPassword
 if ($LASTEXITCODE -ne 0) { throw "Không tạo được tài khoản admin." }
 docker compose up -d
